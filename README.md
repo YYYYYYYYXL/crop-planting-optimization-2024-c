@@ -218,11 +218,11 @@ Python 3.11
 
 ### 1. 拉取项目代码
 
-如果项目已经上传到 Git 仓库，其他人可以这样拉取：
+cmd里运行
 
 ```bash
-git clone <你的仓库地址>
-cd "农作物的种植策略（2024数模竞赛C题）"
+git clone https://gitee.com/yu--xin--lei/crop-planting-optimization-2024-c
+cd crop-planting-optimization-2024-c
 ```
 
 如果仓库中没有包含官方附件，需要手动把以下文件放到项目根目录：
