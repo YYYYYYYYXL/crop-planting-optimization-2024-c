@@ -1,0 +1,2 @@
+﻿status,message,fun_minimized,robust_objective_with_complement,mip_gap,mip_node_count,n_y,n_vars,n_constraints
+0,Optimization terminated successfully. (HiGHS Status 7: Optimal),-40151908.46399509,40151908.46399509,0.018569861544106142,108,7434,8855,7364
