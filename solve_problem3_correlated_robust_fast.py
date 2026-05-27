@@ -825,19 +825,43 @@ def evaluate_solution_under_scenarios(
     plan_name: str,
     complement_bonus: float,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """用问题三相关情景评估任意方案，返回情景明细与年度风险摘要。"""
+    """
+    用问题三相关情景评估任意方案，返回情景明细与年度风险摘要。
+
+    加速版说明：
+    原版在每个“年份-情景-地块-作物”循环里重复扫描全部 yield/cost 样本，
+    这会导致求解器结束后长时间无输出。这里先预计算每年每个情景的平均亩毛利，
+    并把方案行转为轻量 list，避免 pandas iterrows 反复开销。
+    """
     if solution_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    n_scenarios = params["n_scenarios"]
-    scenario_rows: List[Dict[str, Any]] = []
+    n_scenarios = int(params["n_scenarios"])
     crop_ids = sorted(data["crop_by_id"].keys())
-
-    # 为判断互补收益准备：plot-year 是否豆类/非豆类。
     bean_ids = data["bean_ids"]
+
+    # 预计算：每年每个情景的平均亩毛利，用于互补收益估计。
+    avg_margin_by_year_scenario: Dict[int, np.ndarray] = {}
+    for year in YEARS:
+        margin_arrays = []
+        for cid in crop_ids:
+            rel_yields = [arr for (yy, cc, _, _), arr in params["yield_samples"].items() if yy == year and cc == cid]
+            rel_costs = [arr for (yy, cc, _, _), arr in params["cost_samples"].items() if yy == year and cc == cid]
+            price_arr = params["price_samples"].get((year, cid))
+            if not rel_yields or not rel_costs or price_arr is None:
+                continue
+            mean_yield = np.mean(np.vstack(rel_yields), axis=0)
+            mean_cost = np.mean(np.vstack(rel_costs), axis=0)
+            margin_arrays.append(np.maximum(0.0, mean_yield * price_arr - mean_cost))
+        if margin_arrays:
+            avg_margin_by_year_scenario[year] = np.mean(np.vstack(margin_arrays), axis=0)
+        else:
+            avg_margin_by_year_scenario[year] = np.zeros(n_scenarios, dtype=float)
+
+    # 预计算：plot-year 是否种豆类/非豆类。
     plot_year_bean: Dict[Tuple[str, int], int] = {}
     plot_year_nonbean: Dict[Tuple[str, int], int] = {}
-    for _, row in solution_df.iterrows():
+    for row in solution_df.to_dict("records"):
         key = (str(row["地块名"]), int(row["年份"]))
         cid = int(row["作物编号"])
         if cid in bean_ids:
@@ -845,37 +869,66 @@ def evaluate_solution_under_scenarios(
         else:
             plot_year_nonbean[key] = 1
 
+    # 预计算：每年互补面积。这样每个情景只需乘以平均亩毛利。
+    complement_area_by_year: Dict[int, float] = {}
     for year in YEARS:
-        plan_year = solution_df[solution_df["年份"] == year].copy()
-        if plan_year.empty:
+        area_sum = 0.0
+        for land in data["lands"]:
+            plot = land["plot"]
+            prev_bean = data["bean_2023_flag"].get(plot, 0) if year == 2024 else plot_year_bean.get((plot, year - 1), 0)
+            cur_nonbean = plot_year_nonbean.get((plot, year), 0)
+            if prev_bean and cur_nonbean:
+                area_sum += float(land["area"])
+        complement_area_by_year[year] = area_sum
+
+    # 将方案按年份转为轻量 records。
+    plan_records_by_year: Dict[int, List[Dict[str, Any]]] = {}
+    for row in solution_df.to_dict("records"):
+        year = int(row["年份"])
+        cid = int(row["作物编号"])
+        land_type = str(row["地块类型"])
+        if "统计季次" in row and clean_text(row.get("统计季次")):
+            stat_season = clean_text(row.get("统计季次"))
+        elif land_type in ["平旱地", "梯田", "山坡地"]:
+            stat_season = "单季"
+        elif cid == RICE_ID:
+            stat_season = "单季"
+        else:
+            stat_season = "第一季" if int(row["季次编号"]) == 1 else "第二季"
+        plan_records_by_year.setdefault(year, []).append({
+            "cid": cid,
+            "land_type": land_type,
+            "stat_season": stat_season,
+            "area": float(row["种植面积/亩"]),
+        })
+
+    scenario_rows: List[Dict[str, Any]] = []
+    for year in YEARS:
+        plan_year = plan_records_by_year.get(year, [])
+        if not plan_year:
             continue
+        if n_scenarios >= 50:
+            print(f"正在评估 {plan_name}：{year} 年，共 {n_scenarios} 个情景...")
         for s in range(n_scenarios):
             production = {cid: 0.0 for cid in crop_ids}
             cost_total = 0.0
             area_total = 0.0
-            for _, row in plan_year.iterrows():
-                cid = int(row["作物编号"])
-                land_type = str(row["地块类型"])
-                if "统计季次" in row and clean_text(row.get("统计季次")):
-                    stat_season = clean_text(row.get("统计季次"))
-                elif land_type in ["平旱地", "梯田", "山坡地"]:
-                    stat_season = "单季"
-                elif cid == RICE_ID:
-                    stat_season = "单季"
-                else:
-                    stat_season = "第一季" if int(row["季次编号"]) == 1 else "第二季"
-                area = float(row["种植面积/亩"])
+            for row in plan_year:
+                cid = row["cid"]
+                land_type = row["land_type"]
+                stat_season = row["stat_season"]
+                area = row["area"]
                 yld = params["yield_samples"][(year, cid, land_type, stat_season)][s]
                 cost = params["cost_samples"][(year, cid, land_type, stat_season)][s]
                 production[cid] += area * yld
                 cost_total += area * cost
                 area_total += area
 
-            # 销售受单作物需求和替代组容量双重约束。
             raw_sold = {}
             for cid in crop_ids:
                 demand = params["demand_samples"][(year, cid)][s]
                 raw_sold[cid] = min(production[cid], demand)
+
             sold = dict(raw_sold)
             for group, cids in params["groups"].items():
                 group_raw = sum(raw_sold[cid] for cid in cids)
@@ -893,25 +946,11 @@ def evaluate_solution_under_scenarios(
                 produced_total += production[cid]
                 sold_total += sold[cid]
 
-            # 互补收益估计：上一年有豆类，当年有非豆类。
-            complement_value = 0.0
-            for land in data["lands"]:
-                plot = land["plot"]
-                area = float(land["area"])
-                prev_bean = data["bean_2023_flag"].get(plot, 0) if year == 2024 else plot_year_bean.get((plot, year - 1), 0)
-                cur_nonbean = plot_year_nonbean.get((plot, year), 0)
-                if prev_bean and cur_nonbean:
-                    # 用当年平均亩毛利近似互补收益。
-                    margins = []
-                    for cid in crop_ids:
-                        price = params["price_samples"][(year, cid)][s]
-                        relevant_yields = [arr[s] for (yy, cc, _, _), arr in params["yield_samples"].items() if yy == year and cc == cid]
-                        relevant_costs = [arr[s] for (yy, cc, _, _), arr in params["cost_samples"].items() if yy == year and cc == cid]
-                        if relevant_yields and relevant_costs:
-                            margins.append(max(0.0, float(np.mean(relevant_yields)) * price - float(np.mean(relevant_costs))))
-                    avg_margin = float(np.mean(margins)) if margins else 0.0
-                    complement_value += complement_bonus * area * avg_margin
-
+            complement_value = (
+                complement_bonus
+                * complement_area_by_year.get(year, 0.0)
+                * avg_margin_by_year_scenario[year][s]
+            )
             profit = revenue - cost_total + complement_value
             unsold_ratio = 0.0 if produced_total <= 1e-12 else max(0.0, produced_total - sold_total) / produced_total
             scenario_rows.append({
@@ -948,7 +987,7 @@ def evaluate_solution_under_scenarios(
             "最差情景利润/元": float(np.min(profits)),
             "平均滞销比例": float(g["滞销比例"].mean()),
         })
-    # 总计口径：按情景汇总 2024-2030。
+
     total = scenario_df.groupby(["方案", "情景编号"], as_index=False).agg({"利润/元": "sum", "滞销量/斤": "sum", "产量/斤": "sum"})
     for plan_name_value, g in total.groupby("方案"):
         profits = g["利润/元"].to_numpy(dtype=float)
@@ -966,7 +1005,6 @@ def evaluate_solution_under_scenarios(
             "平均滞销比例": unsold_ratio,
         })
     return scenario_df, pd.DataFrame(summary_rows)
-
 
 def build_year_summary(solution_df: pd.DataFrame, sold_df: pd.DataFrame, data: Dict[str, Any], params: Dict[str, Any], status_info: Dict[str, Any]) -> pd.DataFrame:
     rows = []
@@ -1113,6 +1151,17 @@ def main() -> None:
         gap=args.gap,
         disp=not args.quiet,
     )
+
+    # 关键修正：求解器结束后先落盘核心结果，避免后续风险评估耗时导致长时间没有输出文件。
+    out_dir.mkdir(parents=True, exist_ok=True)
+    early_result_path = out_dir / "result3.xlsx"
+    early_template_path = base_dir / "附件3" / args.template
+    write_result_template(early_template_path, early_result_path, solution_df)
+    solution_df.to_csv(out_dir / "problem3_solution_long.csv", index=False, encoding="utf-8-sig")
+    sold_df.to_csv(out_dir / "problem3_sold.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([status_info]).to_csv(out_dir / "problem3_solver_status.csv", index=False, encoding="utf-8-sig")
+    print(f"求解完成，已先写出核心结果：{early_result_path}")
+    print("继续进行多情景风险评估和与问题二比较...")
 
     scenario_df, risk_summary_df = evaluate_solution_under_scenarios(
         data=data,
