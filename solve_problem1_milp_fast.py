@@ -271,6 +271,65 @@ def build_records(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     return records
 
 
+def make_solver(
+    solver_name: str,
+    time_limit: int,
+    gap: float,
+    threads: int,
+    solver_msg: bool,
+):
+    """
+    创建 MILP 求解器。
+
+    原脚本慢的一个主要原因是 time_limit/gap/quiet 参数没有传给 CBC。
+    这里优先使用 HiGHS；如果本机没有 HiGHS，则自动回退到 CBC，并把时间、gap、线程数真正传进去。
+    """
+    solver_name = (solver_name or "auto").lower()
+
+    def build_highs():
+        # PuLP 新版本提供 HiGHS Python 接口。conda 安装 highspy 后速度通常明显快于 CBC。
+        if hasattr(pulp, "HiGHS"):
+            return pulp.HiGHS(
+                msg=solver_msg,
+                timeLimit=time_limit,
+                gapRel=gap,
+                threads=threads,
+            )
+        # 某些版本只有命令行接口。
+        if hasattr(pulp, "HiGHS_CMD"):
+            return pulp.HiGHS_CMD(
+                msg=solver_msg,
+                timeLimit=time_limit,
+                gapRel=gap,
+                threads=threads,
+            )
+        raise RuntimeError("当前 PuLP 没有 HiGHS/HiGHS_CMD 接口")
+
+    def build_cbc():
+        # 关键修复：原代码这里使用 COIN_CMD(path='cbc', msg=True)，没有传入 timeLimit/gapRel/threads。
+        return pulp.PULP_CBC_CMD(
+            msg=solver_msg,
+            timeLimit=time_limit,
+            gapRel=gap,
+            threads=threads,
+            presolve=True,
+            cuts=True,
+            strong=5,
+            timeMode="elapsed",
+        )
+
+    if solver_name in ["highs", "highspy"]:
+        return build_highs()
+    if solver_name == "cbc":
+        return build_cbc()
+
+    # auto：优先 HiGHS，失败再用 CBC。
+    try:
+        return build_highs()
+    except Exception:
+        return build_cbc()
+
+
 def solve_one_case(
     data: Dict[str, Any],
     discount_rate: float,
@@ -280,6 +339,8 @@ def solve_one_case(
     min_open: float,
     min_greenhouse: float,
     solver_msg: bool,
+    solver_name: str,
+    threads: int,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     records = build_records(data)
     rid_to_rec = {r["rid"]: r for r in records}
@@ -431,7 +492,13 @@ def solve_one_case(
         obj_terms.append(revenue - cost)
     model += pulp.lpSum(obj_terms)
 
-    solver = pulp.COIN_CMD(path="cbc", msg=True)
+    solver = make_solver(
+        solver_name=solver_name,
+        time_limit=time_limit,
+        gap=gap,
+        threads=threads,
+        solver_msg=solver_msg,
+    )
     status_code = model.solve(solver)
     status = pulp.LpStatus[status_code]
 
@@ -477,6 +544,8 @@ def solve_one_case(
         "gap": gap,
         "min_open_area": min_open,
         "min_greenhouse_area": min_greenhouse,
+        "solver": solver_name,
+        "threads": threads,
     }
     return selected, summary
 
@@ -576,8 +645,10 @@ def main() -> None:
     parser.add_argument("--att2", type=str, default="附件2.xlsx", help="附件2文件名")
     parser.add_argument("--template-dir", type=str, default="附件3", help="模板文件夹")
     parser.add_argument("--out-dir", type=str, default="output", help="输出文件夹")
-    parser.add_argument("--time-limit", type=int, default=600, help="单个情形最大求解秒数，默认 600")
-    parser.add_argument("--gap", type=float, default=0.005, help="相对 MIP gap，默认 0.005")
+    parser.add_argument("--time-limit", type=int, default=300, help="单个情形最大求解秒数，默认 300")
+    parser.add_argument("--gap", type=float, default=0.02, help="相对 MIP gap，默认 0.02；数学建模中 1%-2% 通常比死等全局证明更实用")
+    parser.add_argument("--solver", type=str, default="auto", choices=["auto", "highs", "cbc"], help="MILP 求解器，默认 auto：优先 HiGHS，失败回退 CBC")
+    parser.add_argument("--threads", type=int, default=0, help="求解线程数，0 表示自动使用 CPU 核心数")
     parser.add_argument("--min-open", type=float, default=1.0, help="露天耕地单作物最小面积，默认 1 亩")
     parser.add_argument("--min-greenhouse", type=float, default=0.1, help="大棚单作物最小面积，默认 0.1 亩")
     parser.add_argument("--quiet", action="store_true", help="不显示求解日志")
@@ -586,6 +657,9 @@ def main() -> None:
     base_dir = Path(args.base).resolve()
     template_dir = base_dir / args.template_dir
     out_dir = base_dir / args.out_dir
+    if args.threads is None or args.threads <= 0:
+        import os
+        args.threads = max(1, (os.cpu_count() or 2) - 1)
 
     print("读取附件数据...")
     data = load_data(base_dir, args.att1, args.att2)
@@ -603,6 +677,8 @@ def main() -> None:
         min_open=args.min_open,
         min_greenhouse=args.min_greenhouse,
         solver_msg=not args.quiet,
+        solver_name=args.solver,
+        threads=args.threads,
     )
     print(summary1)
 
@@ -616,6 +692,8 @@ def main() -> None:
         min_open=args.min_open,
         min_greenhouse=args.min_greenhouse,
         solver_msg=not args.quiet,
+        solver_name=args.solver,
+        threads=args.threads,
     )
     print(summary2)
 
